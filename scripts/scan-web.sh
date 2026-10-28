@@ -13,16 +13,43 @@ if [ -z "$HOST" ]; then
   exit 2
 fi
 HOST="${HOST%/}"
-HOSTNAME="$(printf '%s' "$HOST" | sed -E 's#^https?://##; s#/.*$##')"
+
+# Разбор хоста и порта для корректной работы с кастомными портами (например, https://example.com:8443)
+HOST_NO_PROTO="$(printf '%s' "$HOST" | sed -E 's#^https?://##; s#/.*$##')"
+if [[ "$HOST_NO_PROTO" =~ :([0-9]+)$ ]]; then
+  TLS_HOST="${HOST_NO_PROTO%:*}"
+  TLS_PORT="${BASH_REMATCH[1]}"
+else
+  TLS_HOST="$HOST_NO_PROTO"
+  TLS_PORT="443"
+fi
+HOSTNAME="$TLS_HOST"
 fail=0
 
 note() { printf '%-6s %s\n' "$1" "$2"; }
 bad()  { note "FAIL" "$1"; fail=1; }
 ok()   { note "ok" "$1"; }
 
+# Кроссплатформенный запуск с таймаутом (macOS не имеет timeout из коробки)
+run_with_timeout() {
+  local secs="$1"
+  shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$secs" "$@"
+  elif command -v gtimeout >/dev/null 2>&1; then
+    gtimeout "$secs" "$@"
+  else
+    "$@"
+  fi
+}
+
 echo "== 1. доступность =="
 code="$(curl -s -o /dev/null -m 15 -w '%{http_code}' "$HOST/")"
-[ "$code" = "200" ] && ok "главная 200" || bad "главная отвечает $code"
+case "$code" in
+  200) ok "главная 200" ;;
+  301|302|307|308) ok "главная отвечает редиректом $code" ;;
+  *) bad "главная отвечает $code" ;;
+esac
 
 echo "== 2. редирект с http =="
 plain="http://$HOSTNAME/"
@@ -44,16 +71,18 @@ printf '%s' "$headers" | grep -qi 'server:' && note "info" "раскрывает
 
 echo "== 4. куки =="
 if printf '%s' "$headers" | grep -qi '^set-cookie:'; then
-  printf '%s' "$headers" | grep -i '^set-cookie:' | while read -r line; do
-    printf '%s' "$line" | grep -qi 'secure' || echo "FAIL кука без Secure: ${line:0:60}…"
-    printf '%s' "$line" | grep -qi 'httponly' || echo "WARN кука без HttpOnly: ${line:0:60}…"
-  done
+  # Process substitution, чтобы bad() выставлял fail=1 в основном шелле
+  while read -r line; do
+    printf '%s' "$line" | grep -qi 'secure' && ok "кука с Secure: ${line:0:40}…" || bad "кука без Secure: ${line:0:60}…"
+    printf '%s' "$line" | grep -qi 'httponly' && ok "кука с HttpOnly: ${line:0:40}…" || note "WARN" "кука без HttpOnly: ${line:0:60}…"
+    printf '%s' "$line" | grep -qi 'samesite' && ok "кука с SameSite: ${line:0:40}…" || note "P3" "кука без SameSite: ${line:0:60}…"
+  done < <(printf '%s\n' "$headers" | grep -i '^set-cookie:')
 else
   note "info" "куки на этом ответе не ставятся"
 fi
 
 echo "== 5. TLS =="
-tls="$(echo | timeout 20 openssl s_client -connect "$HOSTNAME:443" -servername "$HOSTNAME" 2>/dev/null)"
+tls="$(echo | run_with_timeout 20 openssl s_client -connect "$TLS_HOST:$TLS_PORT" -servername "$TLS_HOST" 2>/dev/null)"
 printf '%s' "$tls" | grep -q "Protocol  : TLSv1.3" && ok "TLS 1.3 доступен" || note "info" "TLS 1.3 не подтверждён"
 exp="$(printf '%s' "$tls" | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)"
 [ -n "$exp" ] && ok "сертификат до: $exp" || bad "не удалось прочитать сертификат"
@@ -61,9 +90,25 @@ printf '%s' "$tls" | grep -qi "verify return code: 0" && ok "цепочка пр
 
 echo "== 6. известные утечки файлов =="
 for path in "/.env" "/.git/config" "/backup.zip" "/db.sqlite3" "/.DS_Store" "/server-status" "/static/../.env"; do
-  code="$(curl -s -o /dev/null -m 10 -w '%{http_code}' "$HOST$path")"
+  # Проверяем код ответа и Content-Type для защиты от ложных срабатываний в SPA
+  res="$(curl -s -o /dev/null -m 10 -w '%{http_code}|%{content_type}' "$HOST$path")"
+  code="${res%%|*}"
+  ctype="${res#*|}"
   case "$code" in
-    200|206) bad "$path отдаётся ($code)" ;;
+    200|206)
+      if printf '%s' "$ctype" | grep -qi 'text/html'; then
+        body="$(curl -s -m 10 "$HOST$path" | head -n 5)"
+        if [ "$path" = "/.git/config" ] && printf '%s' "$body" | grep -q '\[core\]'; then
+          bad "$path отдаётся ($code, $ctype)"
+        elif [ "$path" = "/.env" ] && printf '%s' "$body" | grep -qE '^[A-Z0-9_]+=.+'; then
+          bad "$path отдаётся ($code, $ctype)"
+        else
+          note "info" "$path вернул $code ($ctype), похоже на SPA fallback index.html"
+        fi
+      else
+        bad "$path отдаётся ($code, $ctype)"
+      fi
+      ;;
     401|403) note "warn" "$path закрыт, но лучше 404 ($code)" ;;
     *) ok "$path → $code" ;;
   esac
