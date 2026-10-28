@@ -43,12 +43,21 @@ SINK_PATTERNS = [
     # только сборка запроса из переменных: литерал вроде execute("SELECT 1") безопасен
     ("SQL строкой", re.compile(r"\.(?:raw|execute)\s*\(\s*(?:f[\"']|[\"'][^\"']*[\"']\s*%|\w+\s*\+|\w+\s*%)"), "P1",
      "Возможна инъекция: передавать параметры, а не склеивать строку."),
+    ("SSTI (render_template_string)", re.compile(r"\brender_template_string\s*\("), "P1",
+     "Server-Side Template Injection: шаблонизация строки из переменной."),
 ]
 
 SKIP_SINK_DIRS = {"tests", "test", "testing", "migrations", "docs", "examples", "vendor"}
 
+# Шаблоны для поиска команд архивации/передачи файлов в деплой-скриптах
+TRANSFER_CMD_RX = re.compile(r"\b(?:rsync|tar)\b[^\n;&|]+")
+EXCLUDE_RX = re.compile(r"--exclude[=\s]+['\"]?([^\s'\";]+)")
+ENV_TEMPLATE_SUFFIXES = {".example", ".sample", ".template", ".dist", ".default"}
 
-DEPLOY_EXCLUDE_HINTS = ("tar ", "rsync ", "--exclude")
+
+def is_env_template(name: str) -> bool:
+    """Проверка, является ли файл безопасным примером/шаблоном (.env.example и т.д.)."""
+    return any(name.endswith(suffix) for suffix in ENV_TEMPLATE_SUFFIXES)
 
 
 def sh(cmd: list[str], cwd: Path, timeout: int = 300) -> tuple[int, str]:
@@ -86,8 +95,23 @@ def scan_secrets(root: Path) -> list[dict]:
     env_files = []
     for path in walk_files(root):
         name = path.name
-        if name == ".env" or name.startswith(".env."):
-            env_files.append(str(path.relative_to(root)))
+        rel_path = path.relative_to(root)
+        # Исключаем шаблоны примеров вроде .env.example, .env.sample из списков боевых env
+        if is_env_template(name):
+            # Шаблоны сканируем только на случайные реальные секреты ниже
+            pass
+        elif name == ".env" or name.startswith(".env."):
+            # Проверяем, не закоммичен ли боевой .env файл в git
+            code, out = sh(["git", "ls-files", str(rel_path)], root)
+            if code == 0 and out.strip():
+                findings.append({
+                    "title": "Секретный env-файл отслеживается в git!",
+                    "severity": "P1",
+                    "where": str(rel_path),
+                    "evidence": "файл добавлен в индекс git и попадает в историю репозитория",
+                    "fix": "Удалить из git (git rm --cached), добавить в .gitignore, отозвать попавшие в историю ключи.",
+                })
+            env_files.append(str(rel_path))
             continue
         try:
             text = path.read_text(encoding="utf-8", errors="ignore")
@@ -100,7 +124,7 @@ def scan_secrets(root: Path) -> list[dict]:
                 findings.append({
                     "title": f"Похоже на секрет: {name_rx}",
                     "severity": "P1",
-                    "where": f"{path.relative_to(root)}:{line}",
+                    "where": f"{rel_path}:{line}",
                     "evidence": f"найден фрагмент {redact(raw)}",
                     "fix": "Перенести в EnvironmentFile с правами 600, отозвать и перевыпустить ключ.",
                 })
@@ -152,7 +176,6 @@ def scan_sinks(root: Path) -> list[dict]:
 
 def scan_deploy_excludes(root: Path) -> list[dict]:
     findings = []
-    rx = re.compile(r"--exclude[=\s]+['\"]?([^\s'\";]+)")
     for path in root.rglob("*.sh"):
         if any(part in SKIP_DIRS for part in path.parts):
             continue
@@ -160,41 +183,64 @@ def scan_deploy_excludes(root: Path) -> list[dict]:
             text = path.read_text(encoding="utf-8", errors="ignore")
         except OSError:
             continue
-        if "--exclude" not in text:
-            continue
-        patterns = [p.strip("'\"") for p in rx.findall(text)]
-        if any(p == ".env" or p.startswith(".env") for p in patterns):
-            continue
-        findings.append({
-            "title": "Деплой-скрипт не исключает .env",
-            "severity": "P1",
-            "where": str(path.relative_to(root)),
-            "evidence": "в командах передачи есть --exclude, но .env в списке нет",
-            "fix": "Добавить --exclude=.env --exclude='.env.*'; проверить, что файла нет на сервере.",
-        })
+        
+        for match in TRANSFER_CMD_RX.finditer(text):
+            cmd_line = match.group(0).strip()
+            # Проверяем команды архивации или синхронизации
+            if not ("rsync" in cmd_line or "tar" in cmd_line):
+                continue
+            excludes = [p.strip("'\"") for p in EXCLUDE_RX.findall(cmd_line)]
+            has_env_exclude = any(p == ".env" or p.startswith(".env") for p in excludes)
+            if not has_env_exclude:
+                line = text[: match.start()].count("\n") + 1
+                evidence = "команда передачи без исключения .env: " + cmd_line[:80]
+                findings.append({
+                    "title": "Деплой-скрипт не исключает .env",
+                    "severity": "P1",
+                    "where": f"{path.relative_to(root)}:{line}",
+                    "evidence": evidence,
+                    "fix": "Добавить --exclude=.env --exclude='.env.*'; проверить, что файла нет на сервере.",
+                })
     return findings
 
 
+POST_PATTERNS = [
+    re.compile(r"def\s+post\s*\("),
+    re.compile(r"@(?:app|router|api|blueprint|bp)\.post\s*\("),
+    re.compile(r"@(?:app|router|api|blueprint|bp)\.route\s*\([^)]*methods\s*=\s*\[[^\]]*['\"]POST['\"]", re.IGNORECASE),
+    re.compile(r"@api_view\s*\(\s*\[[^\]]*['\"]POST['\"]", re.IGNORECASE),
+    re.compile(r"methods?\s*=\s*\[[^\]]*['\"]POST['\"]", re.IGNORECASE),
+]
+LIMIT_PATTERNS = [
+    re.compile(r"(?i)ratelimit|rate_limit|throttle|throttling"),
+]
+
+
 def scan_rate_limits(root: Path) -> list[dict]:
-    has_post = False
-    has_limit = False
+    unprotected_files = []
     for path in walk_files(root):
-        if path.suffix.lower() != ".py":
+        if path.suffix.lower() not in {".py", ".ts", ".js"}:
+            continue
+        if any(part.lower() in SKIP_SINK_DIRS for part in path.parts):
             continue
         try:
             text = path.read_text(encoding="utf-8", errors="ignore")
         except OSError:
             continue
-        if re.search(r"(?i)method\s*=\s*[\"']POST[\"']|def post\(", text):
-            has_post = True
-        if re.search(r"(?i)ratelimit|throttle|rate_limit", text):
-            has_limit = True
-    if has_post and not has_limit:
+        has_post = any(rx.search(text) for rx in POST_PATTERNS)
+        if has_post:
+            has_limit = any(rx.search(text) for rx in LIMIT_PATTERNS)
+            if not has_limit:
+                unprotected_files.append(str(path.relative_to(root)))
+
+    if unprotected_files:
+        sample = ", ".join(unprotected_files[:5])
+        suffix = f" (и ещё {len(unprotected_files) - 5})" if len(unprotected_files) > 5 else ""
         return [{
-            "title": "Нет ограничения частоты на записывающих ручках",
+            "title": "Нет ограничения частоты на записывающих ручках (rate limit)",
             "severity": "P2",
-            "where": "весь проект",
-            "evidence": "найдены POST-обработчики, упоминаний ratelimit/throttle нет",
+            "where": sample + suffix,
+            "evidence": f"найдены POST-обработчики без упоминаний ratelimit/throttle в {len(unprotected_files)} файлах",
             "fix": "Счётчик на IP+ключ с окном 1-10 минут; лимит размера тела; лимит на /login и /upload.",
         }]
     return []
@@ -244,34 +290,36 @@ def scan_deps(root: Path) -> list[dict]:
         })
         return findings
 
-    code, out = sh(audit + ["-r", str(req), "--progress-spinner", "off"], root)
-    if code not in (0, 1):
-        findings.append({
-            "title": "pip-audit завершился ошибкой",
-            "severity": "P3", "where": str(req),
-            "evidence": out.strip()[-400:], "fix": "Разобрать вывод вручную.",
-        })
-        return findings
-    if "No known vulnerabilities found" in out:
-        findings.append({
-            "title": "pip-audit: известных уязвимостей нет",
-            "severity": "info", "where": str(req.relative_to(root)),
-            "evidence": "проверка пройдена",
-            "fix": "Помнить про pre-CVE: сравнить версии периметра с changelog вендоров вручную.",
-        })
-    else:
-        for line in out.splitlines():
-            if re.search(r"(?i)CVE-|GHSA-|fix", line):
-                findings.append({
-                    "title": "Уязвимая зависимость", "severity": "P1",
-                    "where": str(req.relative_to(root)), "evidence": line.strip()[:200],
-                    "fix": "Поднять версию до последней патченной, пол в lock, перезапуск.",
-                })
     try:
-        if req.name == ".audit-req.txt":
-            req.unlink()
-    except OSError:
-        pass
+        code, out = sh(audit + ["-r", str(req), "--progress-spinner", "off"], root)
+        if code not in (0, 1):
+            findings.append({
+                "title": "pip-audit завершился ошибкой",
+                "severity": "P3", "where": str(req),
+                "evidence": out.strip()[-400:], "fix": "Разобрать вывод вручную.",
+            })
+            return findings
+        if "No known vulnerabilities found" in out:
+            findings.append({
+                "title": "pip-audit: известных уязвимостей нет",
+                "severity": "info", "where": str(req.relative_to(root)),
+                "evidence": "проверка пройдена",
+                "fix": "Помнить про pre-CVE: сравнить версии периметра с changelog вендоров вручную.",
+            })
+        else:
+            for line in out.splitlines():
+                if re.search(r"(?i)CVE-|GHSA-|fix", line):
+                    findings.append({
+                        "title": "Уязвимая зависимость", "severity": "P1",
+                        "where": str(req.relative_to(root)), "evidence": line.strip()[:200],
+                        "fix": "Поднять версию до последней патченной, пол в lock, перезапуск.",
+                    })
+    finally:
+        try:
+            if req and req.name == ".audit-req.txt":
+                req.unlink()
+        except OSError:
+            pass
     return findings
 
 
