@@ -74,11 +74,19 @@ fi
 echo "== 5. сервис $UNIT =="
 unit="$($SSH "systemctl show $UNIT -p User -p NoNewPrivileges -p ProtectSystem -p PrivateTmp -p FragmentPath 2>/dev/null")"
 printf '%s\n' "$unit" | sed -n '1,8p'
-printf '%s\n' "$unit" | grep -qi 'User=root' && bad "$UNIT работает от root"
+# В systemd при отсутствии директивы User= сервис выполняется от root (UID 0).
+# Проверяем как явный User=root, так и отсутствие директивы (User=).
+unit_user="$(printf '%s\n' "$unit" | grep -i '^User=' | cut -d= -f2)"
+if [ -z "$unit_user" ] || [ "$unit_user" = "root" ]; then
+  bad "$UNIT работает от root (User=${unit_user:-root по умолчанию})"
+else
+  ok "$UNIT работает от пользователя $unit_user"
+fi
 printf '%s\n' "$unit" | grep -qi 'NoNewPrivileges=yes' && ok "NoNewPrivileges=yes" || note "NoNewPrivileges не включён"
 printf '%s\n' "$unit" | grep -qi 'ProtectSystem=\(strict\|full\)' && ok "ProtectSystem включён" || note "ProtectSystem не включён"
 printf '%s\n' "$unit" | grep -qi 'PrivateTmp=yes' && ok "PrivateTmp=yes" || note "PrivateTmp не включён"
-envfile="$($SSH "systemctl show $UNIT -p EnvironmentFiles 2>/dev/null" | sed 's/^EnvironmentFiles=//; s/ (ignore_errors=.*)$//')"
+# Парсинг списка EnvironmentFiles: удаляем маркеры ignore_errors без жадного сброса остальных путей
+envfile="$($SSH "systemctl show $UNIT -p EnvironmentFiles 2>/dev/null" | sed 's/^EnvironmentFiles=//' | sed -E 's/\s*\(ignore_errors=[^)]*\)//g')"
 for f in $envfile; do
   perm="$($SSH "sudo -n stat -c '%a %U:%G' $f 2>/dev/null" || true)"
   [ -n "$perm" ] || continue
@@ -91,14 +99,14 @@ done
 
 echo "== 6. файлы приложения =="
 $SSH 'for d in /opt/* /srv/app /var/www; do [ -d "$d" ] && ls -ld "$d" && ls -la "$d" | head -12; done 2>/dev/null' | sed -n '1,40p'
-$SSH 'for e in /opt/*/.env /srv/*/.env /var/www/*/.env; do [ -f "$e" ] || continue; m=$(stat -c "%a" "$e" 2>/dev/null); case "$m" in 600|400) echo "info|$e права $m — читает только владелец, допустимо для env_file приложения";; *) echo "FAIL|$e права $m — секреты доступны другим пользователям хоста";; esac; done 2>/dev/null' |
-  while IFS="|" read -r level rest; do
-    [ -z "$level" ] && continue
-    case "$level" in
-      FAIL) bad "$rest" ;;
-      info) note "$rest" ;;
-    esac
-  done
+# Process substitution вместо пайпа, чтобы статус fail=1 сохранялся в основном шелле, а не сгорал в subshell
+while IFS="|" read -r level rest; do
+  [ -z "$level" ] && continue
+  case "$level" in
+    FAIL) bad "$rest" ;;
+    info) note "$rest" ;;
+  esac
+done < <($SSH 'for e in /opt/*/.env /srv/*/.env /var/www/*/.env; do [ -f "$e" ] || continue; m=$(stat -c "%a" "$e" 2>/dev/null); case "$m" in 600|400) echo "info|$e права $m — читает только владелец, допустимо для env_file приложения";; *) echo "FAIL|$e права $m — секреты доступны другим пользователям хоста";; esac; done 2>/dev/null')
 
 echo "== 7. каталог загрузок =="
 $SSH 'findmnt -no TARGET,OPTIONS /var/lib 2>/dev/null; for m in /opt/*/media /srv/*/media; do [ -d "$m" ] && findmnt -no TARGET,OPTIONS --target "$m" 2>/dev/null; done' | sed -n '1,6p'
