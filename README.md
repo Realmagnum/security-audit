@@ -35,14 +35,17 @@ scripts/scan-host.sh            хост по ssh: sshd, порты, ufw, fail2b
 **Claude Code** (личный или проектный скилл):
 
 ```bash
-mkdir -p ~/.claude/skills && git clone https://github.com/<you>/security-audit.git ~/.claude/skills/security-audit
-# или в проект:  git clone ... .claude/skills/security-audit
+mkdir -p ~/.claude/skills && git clone https://github.com/Arturio48/security-audit.git ~/.claude/skills/security-audit
+# или в проект:  git clone https://github.com/Arturio48/security-audit.git .claude/skills/security-audit
 ```
 
 **Hermes Agent:**
 
 ```bash
-mkdir -p ~/.agents/skills && git clone https://github.com/<you>/security-audit.git ~/.agents/skills/security-audit
+# глобально в профиль пользователя:
+mkdir -p ~/.hermes/skills && git clone https://github.com/Arturio48/security-audit.git ~/.hermes/skills/security-audit
+# или локально в конкретный проект:
+mkdir -p .hermes/skills && git clone https://github.com/Arturio48/security-audit.git .hermes/skills/security-audit
 ```
 
 **Cursor:** скопировать `SKILL.md` и `references/` в проект, добавить

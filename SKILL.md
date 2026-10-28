@@ -1,6 +1,6 @@
 ---
 name: security-audit
-description: "Find exploits in a web service and close them safely."
+description: "Use when auditing web services or hosts. Finds exploits."
 version: 1.0.0
 author: Artur Korobkin (Arturio48), Hermes Agent
 license: MIT
